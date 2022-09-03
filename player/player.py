@@ -1,7 +1,5 @@
-from collections import defaultdict
 from multiprocessing.dummy import Process
 from queue import Empty
-import random
 from multiprocessing import Manager
 import os
 import time
@@ -9,6 +7,13 @@ import importlib_resources
 import sys
 
 from PyQt5 import QtWidgets, QtGui, QtCore
+
+
+from player.random_play import PlaylistAutoPlay
+import player.actions.open_folder as open_folder
+import player.actions.delete as delete_file
+import player.actions.check_duplicates as check_duplicates
+
 
 def import_vlc():
     if sys.platform == "win32":
@@ -21,138 +26,54 @@ def import_vlc():
 vlc = import_vlc()
 
 
-IGNORE_FILE_EXTENSIONS = (
-    'nfo', 'txt', 'exe' ,'pdf', 'gif', 'css', 'js', 'html'
-)
-
-
-class PlaylistAutoPlay:
-    """This plays a list of files.
-
-    It keeps the back and forward history (so if you go back when you go forward again it will be the same file).
-
-    It can play the list in loop with and without replacement.
-
-    """
-    def __init__(self, playlist) -> None:
-        self.playlist = playlist
-
-        self.loop = True
-        self.shuffle = True
-        self.with_replacement = False
-        self.remains = []
-
-        self.history = []
-        self.next_items = []
-
-    def select(self):
-        if self.shuffle:
-            return random.randrange(0, len(self.remains))
-        else:
-            return 0
-
-    def reset(self):
-        self.remains = list(self.playlist.keys())
-        self.history = []
-        self.next_items = []
-
-    def next(self):
-        while self.next_items:
-            item = self.next_items.pop()
-            self.history.append(item)
-            return self.playlist[item]
-
-        if len(self.remains) == 0:
-            if self.loop:
-                self.reset()
-            else:
-                return None
-
-        idx = self.select()
-
-        if not self.with_replacement:
-            selected = self.remains.pop(idx)
-        else:
-            selected = self.remains[idx]
-
-        self.history.append(selected)
-        return self.playlist[selected]
-
-    def previous(self):
-        if len(self.history) < 2:
-            return None
-
-        current = self.history.pop(-1)
-        self.next_items.append(current)
-
-        prev = self.history[-1]
-        return self.playlist[prev]
-
-
-def async_open_folder(queue, folder):
-    queue.put(('FOLDER_START',))
-
-    duplicates = defaultdict(set)
-    names = dict()
-
-    for root, dirs, files in os.walk(folder):
-
-        for file in files:
-            ext = file.rsplit('.', maxsplit=1)[-1]
-
-            if ext in IGNORE_FILE_EXTENSIONS:
-                continue
-
-            f = os.path.join(root, file)
-
-            if file in names and f != names[file]:
-                original = names[file]
-                duplicates[file].add(original)
-                duplicates[file].add(f)
-                continue
-
-            names[file] = f
-            queue.put(('FOLDER_ITEM', file, f))
-
-    for k, v in duplicates.items():
-        print(k)
-        for item in v:
-            print(f'    - {item}')
-
-    queue.put(('FOLDER_END',))
-
-
-
 class Player(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         QtWidgets.QMainWindow.__init__(self, parent)
         self.setWindowTitle("Media Player")
 
+        # Widgets Setup
         self.instance = vlc.Instance()
         self.vlcplayer = self.instance.media_player_new()
         self.vlcplayer.audio_set_volume(0)
         self.playlist = self._playlist()
+        self.search = None
+        self.playlist_items  = []
 
         self.videoframe = QtWidgets.QFrame()
         self._update_frame()
 
         self.volume = self._volume_slider()
         self.position = self._position_slider()
+        # -------------
+
         self.layout()
 
+        # Playlist data
+        self.base_folder = None
+        self.names = dict()
+        self.auto_play = PlaylistAutoPlay(self.names)
+        # -------------
+
+        self._shortcuts()
+
+        # Async
+        self.manager = Manager()
+        self.queue = self.manager.Queue()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._update_ui)
         self.timer.start()
+        self._tasks = dict()
+        # -------------
 
-        self.names = dict()
-        self.auto_play = PlaylistAutoPlay(self.names)
+    def __enter__(self):
+        return self
 
-        self._shortcuts()
-        self.manager = Manager()
-        self.queue = self.manager.Queue()
+    def __exit__(self, *args):
+        self.manager.__exit__(*args)
 
     def skip(self, diff_seconds):
+        """Skipp a few seconds (forward or back)"""
         # convert to ms
         diff = int(diff_seconds * 1000)
 
@@ -165,52 +86,9 @@ class Player(QtWidgets.QMainWindow):
             pos = new / l
             self.position.setValue(pos * 1000)
 
-    def forward_long(self):
-        self.skip(10)
-
-    def forward_small(self):
-        self.skip(0.5)
-
-    def back_small(self):
-        self.skip(-0.5)
-
-    def back_long(self):
-        self.skip(-10)
-
-    def toggle_play_pause(self):
-        self.vlcplayer.pause()
-
-    def next_item(self):
-        item = self.auto_play.next()
-        if item:
-            self.play_file(item)
-
-    def prev_item(self):
-        item = self.auto_play.previous()
-        if item:
-            self.play_file(item)
-
-    def _shortcuts(self):
-        short = QtWidgets.QShortcut("right", self)
-        short.activated.connect(self.forward_small)
-
-        short = QtWidgets.QShortcut("ctrl+right", self)
-        short.activated.connect(self.forward_long)
-
-        short = QtWidgets.QShortcut("left", self)
-        short.activated.connect(self.back_small)
-
-        short = QtWidgets.QShortcut("ctrl+left", self)
-        short.activated.connect(self.back_long)
-
-        short = QtWidgets.QShortcut("space", self)
-        short.activated.connect(self.toggle_play_pause)
-
-        short = QtWidgets.QShortcut("a", self)
-        short.activated.connect(self.prev_item)
-
-        short = QtWidgets.QShortcut("d", self)
-        short.activated.connect(self.next_item)
+    def open_folder(self, folder):
+        self.base_folder = folder
+        self._async_action(open_folder.action, folder)
 
     def play_playlist_item(self, item):
         name = item.text()
@@ -226,48 +104,6 @@ class Player(QtWidgets.QMainWindow):
         playlist.itemActivated.connect(self.play_playlist_item)
         return playlist
 
-    def open_folder(self, folder, depth=0):
-        p = Process(target=async_open_folder, args=(self.queue, folder))
-        p.start()
-
-    def sync_open_folder(self, folder, depth=0):
-        for root, dirs, files in os.walk(folder):
-
-            for file in files:
-                ext = file.rsplit('.', maxsplit=1)[-1]
-
-                if ext in IGNORE_FILE_EXTENSIONS:
-                    continue
-
-                self._add_to_playlist(root, file)
-
-        if depth == 0:
-            print(len(self.names))
-
-            for k, v in self.duplicates.items():
-                print(k)
-                for item in v:
-                    print(f'    - {item}')
-
-            names = sorted([n for n in self.names.keys()])
-            for n in names:
-                item = QtWidgets.QListWidgetItem(n)
-                self.playlist.addItem(item)
-
-            self.auto_play = PlaylistAutoPlay(self.names)
-            self.play_file(self.auto_play.next())
-
-    def _add_to_playlist(self, root, file):
-        f = os.path.join(root, file)
-
-        if file in self.names and f != self.names[file]:
-            original = self.names[file]
-            self.duplicates[file].add(original)
-            self.duplicates[file].add(f)
-            return
-
-        self.names[file] = f
-
     def layout(self):
         widget = QtWidgets.QWidget(self)
         self.setCentralWidget(widget)
@@ -280,7 +116,15 @@ class Player(QtWidgets.QMainWindow):
         # ---
 
         main = QtWidgets.QHBoxLayout()
-        main.addWidget(self.playlist, 20)
+        vbox = QtWidgets.QVBoxLayout()
+        self.search = QtWidgets.QLineEdit()
+
+        vbox.addWidget(self.search, 1)
+        self.search.textChanged.connect(self.filter_playlist)
+        vbox.addWidget(self.playlist, 90)
+
+        vbox.addLayout(self._playlist_controls(), 10)
+        main.addLayout(vbox, 20)
 
         vboxlayout = QtWidgets.QVBoxLayout()
         vboxlayout.addWidget(self.videoframe)
@@ -290,6 +134,44 @@ class Player(QtWidgets.QMainWindow):
         main.addLayout(vboxlayout, 90)
 
         widget.setLayout(main)
+
+    def remove_filter(self):
+        self.auto_play.set_selection_set(None)
+        for item in self.playlist_items:
+            item.setHidden(False)
+
+    def filter_playlist(self, text):
+        if text == '':
+            self.remove_filter()
+
+        count = 0
+        all = self.playlist_items
+        selection = []
+
+        for item in all:
+            contains = text.lower() in item.text().lower()
+            item.setHidden(not contains)
+            count += int(contains)
+
+            if contains:
+                selection.append(item.text())
+
+        self.auto_play.set_selection_set(selection)
+        print(f'{text} {count}')
+
+    def _playlist_controls(self):
+        play = QtWidgets.QPushButton('Play')
+        play.clicked.connect(self.toggle_play_pause)
+        nxt = QtWidgets.QPushButton('Next')
+        nxt.clicked.connect(self.next_item)
+        prv = QtWidgets.QPushButton('Prev')
+        prv.clicked.connect(self.prev_item)
+
+        hbox = QtWidgets.QHBoxLayout()
+        hbox.addWidget(prv)
+        hbox.addWidget(play)
+        hbox.addWidget(nxt)
+        return hbox
 
     def controls_layout(self):
         controls = QtWidgets.QVBoxLayout()
@@ -329,6 +211,7 @@ class Player(QtWidgets.QMainWindow):
         return slider
 
     def play_file(self, file):
+        """Play a file"""
         self.media = self.instance.media_new(file)
         self.vlcplayer.set_media(self.media)
         self.media.parse()
@@ -363,11 +246,78 @@ class Player(QtWidgets.QMainWindow):
 
         state = self.vlcplayer.get_state()
         if state == vlc.State.Ended:
-            self.play_file(self.auto_play.next())
+            self.next_item()
+
+    #
+    #   Shortcuts
+    #
+    def delete_file(self):
+        file = self.auto_play.current()
+        self.next_item()
+
+        path = self.names.pop(file)
+        self.auto_play.remove(file)
+
+        self._async_action(delete_file.action, self.base_folder, path)
+
+    def forward_long(self):
+        """Forward 10 sec"""
+        self.skip(10)
+
+    def forward_small(self):
+        """forward 0.5 sec"""
+        self.skip(0.5)
+
+    def back_small(self):
+        """Go back 0.5 sec"""
+        self.skip(-0.5)
+
+    def back_long(self):
+        """Go back 10 sec"""
+        self.skip(-10)
+
+    def toggle_play_pause(self):
+        """Pause play the video"""
+        self.vlcplayer.pause()
+
+    def next_item(self):
+        """Play next item"""
+        item = self.auto_play.next()
+        if item:
+            self.play_file(item)
+
+    def prev_item(self):
+        """Play previous item"""
+        item = self.auto_play.previous()
+        if item:
+            self.play_file(item)
+
+    def _test_action(self):
+        self._async_action(check_duplicates.action, self.base_folder)
+
+    def _shortcuts(self):
+        shortcuts = [
+            ("right", self.forward_small),
+            ("ctrl+right", self.forward_long),
+            ("left", self.back_small),
+            ("ctrl+left", self.back_long),
+            ("space", self.toggle_play_pause),
+            ("a", self.prev_item),
+            ("d", self.next_item),
+            ('Delete', self.delete_file),
+            ('c', self._test_action)
+        ]
+
+        for k, v in shortcuts:
+            short = QtWidgets.QShortcut(k, self)
+            short.activated.connect(v)
 
     #
     # Async Message handler
     #
+    def _async_action(self, fun, *args, **kwargs):
+        p = Process(target=fun, args=(self.queue,) + args, kwargs=kwargs)
+        p.start()
 
     def _get_result(self):
         try:
@@ -388,16 +338,31 @@ class Player(QtWidgets.QMainWindow):
 
             self._process_result(*item)
 
+    def _add_playlist_item(self, file, path):
+        self.names[file] = path
+
+        item = QtWidgets.QListWidgetItem(file)
+
+        self.playlist_items.append(item)
+        self.playlist.addItem(item)
+
+        # Check if we have a filter on the playlist
+        if self.search and self.search.text() != "":
+            valid = self.search.text().lower() in file.lower()
+            item.setHidden(not valid)
+
+            if valid:
+                self.auto_play.add_to_selection(file)
+        else:
+            self.auto_play.add_to_selection(file)
+
     def _process_result(self, action, *args):
-        if action == "FOLDER_START":
+        if action == open_folder.START:
             print(f'Looking for items')
 
-        if action == "FOLDER_ITEM":
+        if action == open_folder.RESULT:
             file, path = args
-            self.names[file] = path
-
-            item = QtWidgets.QListWidgetItem(file)
-            self.playlist.addItem(item)
+            self._add_playlist_item(file, path)
 
             # wait for a bit before playing the item
             # so it does not always start on the same file
@@ -405,12 +370,12 @@ class Player(QtWidgets.QMainWindow):
                 self.auto_play.reset()
                 self.next_item()
 
-        if action == "FOLDER_END":
+        if action == open_folder.END:
             print(f'Found {len(self.names)} inside the folder')
-            self.auto_play.reset()
+            self.playlist.sortItems()
 
-
-
+            if len(self.names) < 1000:
+                self.next_item()
 
 
 def set_style(app):
@@ -442,12 +407,11 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     set_style(app)
 
-    player = Player()
+    with Player() as player:
+        player.show()
+        player.resize(1280, 720)
 
-    player.show()
-    player.resize(640, 480)
+        args = parser.parse_args()
+        player.open_folder(args.folder)
 
-    args = parser.parse_args()
-    player.open_folder(args.folder)
-
-    sys.exit(app.exec_())
+        sys.exit(app.exec_())
